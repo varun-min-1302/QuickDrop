@@ -1,0 +1,56 @@
+services:
+  # Ephemeral Redis Store (Session TTL 15 mins)
+  redis:
+    image: redis:7-alpine
+    container_name: quickdrop-redis
+    restart: unless-stopped
+    command: redis-server --save "" --appendonly no --maxmemory 128mb --maxmemory-policy volatile-ttl
+    ports:
+      - "6379:6379"
+
+  # coturn TURN / STUN Relay Server
+  coturn:
+    image: coturn/coturn:latest
+    container_name: quickdrop-coturn
+    restart: unless-stopped
+    volumes:
+      - ./docker/coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+    ports:
+      - "3478:3478/tcp"
+      - "3478:3478/udp"
+      - "49152-49200:49152-49200/udp"
+    network_mode: "host"
+
+  # QuickDrop Signaling API Backend
+  server:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.server
+    container_name: quickdrop-server
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - HOST=0.0.0.0
+      - REDIS_URL=redis://redis:6379
+      - SESSION_TTL_SECONDS=900
+      - STUN_SERVERS=stun:stun.l.google.com:19302
+      - TURN_SERVER_URL=turn:localhost:3478
+      - TURN_USERNAME=quickdropuser
+      - TURN_CREDENTIAL=quickdroppass
+    depends_on:
+      - redis
+    ports:
+      - "3000:3000"
+
+  # QuickDrop Static Client & Nginx Gateway
+  client:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.client
+    container_name: quickdrop-client
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      - server

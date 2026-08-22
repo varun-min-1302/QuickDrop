@@ -1,0 +1,97 @@
+:root {
+  /* Colors - Light Theme (Material 3 / Pixel Inspired) */
+  --color-bg: #f8f9fa;
+  --color-surface: #ffffff;
+  --color-surface-variant: #f1f3f4;
+  --color-surface-elevated: #ffffff;
+  --color-primary: #1a73e8;
+  --color-primary-hover: #1557b0;
+  --color-primary-container: #e8f0fe;
+  --color-on-primary-container: #174ea6;
+  --color-success: #1e8e3e;
+  --color-success-container: #e6f4ea;
+  --color-warning: #ea8600;
+  --color-warning-container: #fef7e0;
+  --color-error: #d93025;
+  --color-error-container: #fce8e6;
+  --color-text-primary: #202124;
+  --color-text-secondary: #5f6368;
+  --color-text-muted: #80868b;
+  --color-border: #e0e2e6;
+  --color-border-focus: #1a73e8;
+
+  /* Spacing Tokens */
+  --space-1: 0.25rem;  /* 4px */
+  --space-2: 0.5rem;   /* 8px */
+  --space-3: 0.75rem;  /* 12px */
+  --space-4: 1rem;     /* 16px */
+  --space-5: 1.25rem;  /* 20px */
+  --space-6: 1.5rem;   /* 24px */
+  --space-8: 2rem;     /* 32px */
+  --space-10: 2.5rem;  /* 40px */
+  --space-12: 3rem;    /* 48px */
+
+  /* Shape / Radius Tokens */
+  --radius-xs: 4px;
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 24px;
+  --radius-pill: 9999px;
+
+  /* Elevation / Shadow Tokens */
+  --shadow-1: 0 1px 3px rgba(0, 0, 0, 0.05), 0 1px 2px rgba(0, 0, 0, 0.03);
+  --shadow-2: 0 4px 12px rgba(0, 0, 0, 0.06), 0 2px 4px rgba(0, 0, 0, 0.04);
+  --shadow-3: 0 10px 24px rgba(0, 0, 0, 0.08), 0 4px 8px rgba(0, 0, 0, 0.04);
+
+  /* Motion & Transitions */
+  --motion-duration-fast: 120ms;
+  --motion-duration-normal: 200ms;
+  --motion-duration-slow: 300ms;
+  --motion-easing-standard: cubic-bezier(0.2, 0, 0, 1);
+  --motion-easing-decelerate: cubic-bezier(0, 0, 0.2, 1);
+  --motion-easing-accelerate: cubic-bezier(0.4, 0, 1, 1);
+}
+
+.dark {
+  /* Colors - Dark Theme (Material 3 / Pixel Dark) */
+  --color-bg: #121212;
+  --color-surface: #1e1e1e;
+  --color-surface-variant: #282a2c;
+  --color-surface-elevated: #2d2f31;
+  --color-primary: #8ab4f8;
+  --color-primary-hover: #aecbfa;
+  --color-primary-container: #174ea6;
+  --color-on-primary-container: #d2e3fc;
+  --color-success: #81c995;
+  --color-success-container: #0f5128;
+  --color-warning: #fdd663;
+  --color-warning-container: #5c4300;
+  --color-error: #f28b82;
+  --color-error-container: #5c1410;
+  --color-text-primary: #e8eaed;
+  --color-text-secondary: #9aa0a6;
+  --color-text-muted: #70757a;
+  --color-border: #3c4043;
+  --color-border-focus: #8ab4f8;
+
+  --shadow-1: 0 1px 3px rgba(0, 0, 0, 0.4);
+  --shadow-2: 0 4px 12px rgba(0, 0, 0, 0.5);
+  --shadow-3: 0 10px 24px rgba(0, 0, 0, 0.6);
+}
+
+/* Reduced Motion Override */
+@media (prefers-reduced-motion: reduce) {
+  :root, .dark {
+    --motion-duration-fast: 0ms;
+    --motion-duration-normal: 0ms;
+    --motion-duration-slow: 0ms;
+  }
+  
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

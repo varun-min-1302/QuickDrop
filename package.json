@@ -1,0 +1,28 @@
+{
+  "name": "quickdrop-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Privacy-first QR-based temporary document transfer platform",
+  "workspaces": [
+    "packages/shared",
+    "packages/server",
+    "packages/client"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "test": "npm run test --workspaces",
+    "lint": "npm run lint --workspaces",
+    "typecheck": "npm run typecheck --workspaces",
+    "dev:server": "npm run dev --workspace=packages/server",
+    "dev:client": "npm run dev --workspace=packages/client",
+    "dev": "concurrently \"npm run dev:server\" \"npm run dev:client\"",
+    "tunnel": "node scripts/tunnel.js"
+  },
+  "devDependencies": {
+    "@ngrok/ngrok": "^1.7.0",
+    "concurrently": "^9.1.2",
+    "typescript": "^5.8.2",
+    "vitest": "^3.0.7"
+  }
+}

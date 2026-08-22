@@ -1,0 +1,59 @@
+@import './tokens.css';
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    box-sizing: border-box;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  body {
+    font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+    min-height: 100vh;
+    background-color: var(--color-bg);
+    color: var(--color-text-primary);
+  }
+
+  /*
+   * Accessible focus ring for controls that are their OWN focus target.
+   * Text inputs/textareas are intentionally EXCLUDED: in this app every input is
+   * either composed inside a `focus-within:border-primary` field container
+   * (AuthPage, ShopSetupPage) or carries its own rounded `focus:ring-*`
+   * (CustomerJoinPage, CustomerTransferPage). Applying this square ring to them
+   * too drew a second, sharp-cornered ring nested inside the rounded field — the
+   * "box in a box". Do not re-add input/textarea here.
+   */
+  button, select, a {
+    @apply focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-background;
+  }
+}
+
+/* Material 3 Tactile Ripple / Click Feedback */
+.btn-tactile {
+  transition: transform var(--motion-duration-fast) var(--motion-easing-standard), 
+              background-color var(--motion-duration-normal) ease, 
+              box-shadow var(--motion-duration-normal) ease;
+}
+
+.btn-tactile:active {
+  transform: scale(0.97);
+}
+
+/* Minimum 44px touch targets */
+.touch-target {
+  min-height: 44px;
+  min-width: 44px;
+}
+
+/* Custom smooth progress bar animation */
+@keyframes progress-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.8; }
+}
+
+.progress-animated {
+  animation: progress-pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
