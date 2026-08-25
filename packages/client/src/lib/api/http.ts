@@ -48,24 +48,21 @@ export interface ApiRequestOptions {
 }
 
 /**
- * True when running under Vite's dev server. In dev we add the
- * `ngrok-skip-browser-warning` header so tunnelled requests bypass the interstitial
- * (mirrors the existing behaviour in ShopDashboardPage). Guarded so it is safe in the
- * Node test environment where `import.meta.env` may be absent.
+ * Gets the base API URL from environment variables, or empty string if not set.
+ * Guarded so it is safe in the Node test environment where `import.meta.env` may be absent.
  */
-export function isDev(): boolean {
+export function getApiBaseUrl(): string {
   try {
-    return Boolean((import.meta as { env?: { DEV?: boolean } }).env?.DEV);
+    return (import.meta as { env?: { VITE_API_URL?: string } }).env?.VITE_API_URL || '';
   } catch {
-    return false;
+    return '';
   }
 }
 
 /** Build the request headers. Pure so it can be asserted directly in tests. */
-export function buildHeaders(hasJsonBody: boolean, dev: boolean): Record<string, string> {
+export function buildHeaders(hasJsonBody: boolean): Record<string, string> {
   const headers: Record<string, string> = { Accept: 'application/json' };
   if (hasJsonBody) headers['Content-Type'] = 'application/json';
-  if (dev) headers['ngrok-skip-browser-warning'] = 'true';
   return headers;
 }
 
@@ -115,12 +112,15 @@ export async function apiRequest<T>(path: string, options: ApiRequestOptions = {
   const { method = 'GET', body, signal } = options;
   const hasJsonBody = body !== undefined && body !== null;
 
+  const baseUrl = getApiBaseUrl();
+  const fullPath = baseUrl ? `${baseUrl.replace(/\/$/, '')}${path}` : path;
+
   let res: Response;
   try {
-    res = await fetch(path, {
+    res = await fetch(fullPath, {
       method,
       credentials: 'include',
-      headers: buildHeaders(hasJsonBody, isDev()),
+      headers: buildHeaders(hasJsonBody),
       body: hasJsonBody ? JSON.stringify(body) : undefined,
       signal,
     });

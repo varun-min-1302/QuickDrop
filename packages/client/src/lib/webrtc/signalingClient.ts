@@ -45,8 +45,13 @@ export class SignalingClient {
     if (wsUrl) {
       this.url = wsUrl;
     } else {
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      this.url = `${protocol}//${window.location.host}/ws`;
+      const viteWsUrl = (import.meta as { env?: { VITE_WS_URL?: string } }).env?.VITE_WS_URL;
+      if (viteWsUrl) {
+        this.url = viteWsUrl;
+      } else {
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        this.url = `${protocol}//${window.location.host}/ws`;
+      }
     }
   }
 

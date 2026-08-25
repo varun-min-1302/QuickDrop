@@ -2,17 +2,44 @@ import { IceServerConfig, TransferProgress, DataChannelControlMessage } from '@q
 import { SignalingClient, SignalingEventMap } from './signalingClient.js';
 import { WebRTCPeer } from './peerConnection.js';
 import { FileReceiver, ReceivedDocument } from '../transfer/receiver.js';
+import { isDiagnosticsEnabled, setDiagnosticsEnabled } from '../diagnostics.js';
+
+/**
+ * A received document as the SHOP knows it: the receiver's payload plus durable
+ * customer attribution. Every field the dashboard needs in order to name the owner
+ * travels WITH the document, so a document can always describe its customer even if
+ * it is rendered outside that customer's group or the customer has since dropped.
+ */
+export interface ShopDocument extends ReceivedDocument {
+  clientId: string;
+  batchId: string;
+  customerCode: string;
+  displayName: string | null;
+}
+
+/**
+ * Where a customer's batch stands. Derived from transfers + documents on every
+ * change, never set speculatively, so it can't drift out of step with the queue.
+ */
+export type BatchStatus = 'EMPTY' | 'RECEIVING' | 'READY_TO_PRINT' | 'COMPLETED';
 
 export interface CustomerSession {
   clientId: string;
   peerId: string;
   customerCode: string;
   batchId: string;
+  batchStatus: BatchStatus;
   displayName: string | null;
   connectionState: 'CONNECTING' | 'CONNECTED' | 'DISCONNECTED';
   peer: WebRTCPeer;
   receiver: FileReceiver | null;
   transfers: Map<string, TransferProgress>;
+  /**
+   * Everything this customer has successfully sent, keyed by documentId. This is the
+   * authoritative record of the customer→documents relationship; the dashboard's
+   * React state is a projection of it, never the source of truth.
+   */
+  documents: Map<string, ShopDocument>;
 }
 
 export interface ShopPeerManagerEvents {
@@ -21,7 +48,7 @@ export interface ShopPeerManagerEvents {
   onCustomerLeft?: (clientId: string) => void;
   onConnectionStateChange?: (clientId: string, state: CustomerSession['connectionState']) => void;
   onTransferProgress?: (clientId: string, progress: TransferProgress) => void;
-  onFileReceived?: (clientId: string, doc: ReceivedDocument) => void;
+  onFileReceived?: (clientId: string, doc: ShopDocument) => void;
   onError?: (clientId: string, error: string) => void;
 }
 
@@ -56,8 +83,12 @@ interface TransferLease {
   transferId: string;
   clientId: string;
   state: LeaseState;
-  /** Sends FILE_ACCEPT to the customer. */
-  accept: () => void;
+  /**
+   * Sends FILE_ACCEPT to the customer. Returns false if it could not be sent — a
+   * closed DataChannel does not throw, so this return value is the only reliable
+   * signal that the slot must be released rather than held.
+   */
+  accept: () => boolean | void;
   /** Sends TRANSFER_CANCEL to the customer so its sender stops waiting. */
   notifyCancel: (reason: string) => void;
   watchdog: ReturnType<typeof setTimeout> | null;
@@ -75,20 +106,15 @@ export interface ShopPeerManagerOptions {
   maxConcurrentTransfers?: number;
 }
 
-// ─── Dev-only queue logging (Requirement 15) ───────────────────────────────────
+// ─── Dev-only structured tracing ───────────────────────────────────────────────
+// Tagged, greppable, and OFF in production builds. These exist so a real-device
+// multi-customer failure can be pinned to a stage from a phone's remote console
+// instead of guessed at. Enable/disable at runtime with setTransferQueueLogging().
 
-let QUEUE_LOG_ENABLED = (() => {
-  try {
-    return Boolean((import.meta as any).env?.DEV);
-  } catch {
-    return false;
-  }
-})();
+/** Silence or enable the [QD][…] trace logs (tests turn this off; prod is off). */
+export const setTransferQueueLogging = setDiagnosticsEnabled;
 
-/** Silence or enable the [QUEUE]/[TRANSFER] trace logs (tests turn this off). */
-export function setTransferQueueLogging(enabled: boolean) {
-  QUEUE_LOG_ENABLED = enabled;
-}
+export const isTransferQueueLoggingEnabled = isDiagnosticsEnabled;
 
 const shortId = (id: string | undefined) => (id ? id.slice(0, 8) : 'none');
 
@@ -125,7 +151,68 @@ export class ShopPeerManager {
   }
 
   private log(msg: string) {
-    if (QUEUE_LOG_ENABLED) console.log(msg);
+    if (isDiagnosticsEnabled()) console.log(msg);
+  }
+
+  /** `[QD][QUEUE] active= queued= next=` */
+  private logQueue(extra = '') {
+    if (!isDiagnosticsEnabled()) return;
+    const queued = this.getQueuedTransferIds();
+    console.log(
+      `[QD][QUEUE] active=${this.getActiveTransferCount()} queued=${queued.length} next=${shortId(queued[0])}${extra ? ' ' + extra : ''}`,
+    );
+  }
+
+  /** `[QD][TRANSFER] clientId= batchId= transferId= fileName= state=` */
+  private logTransfer(clientId: string, transferId: string, state: string, fileName = '') {
+    if (!isDiagnosticsEnabled()) return;
+    const cust = this.customers.get(clientId);
+    const name = fileName || cust?.transfers.get(transferId)?.fileName || '';
+    console.log(
+      `[QD][TRANSFER] clientId=${shortId(clientId)} batchId=${shortId(cust?.batchId)} transferId=${shortId(transferId)} fileName=${name} state=${state}`,
+    );
+  }
+
+  /** `[QD][CUSTOMER] clientId= peerId= customerCode= batchId=` */
+  private logCustomer(cust: Pick<CustomerSession, 'clientId' | 'peerId' | 'customerCode' | 'batchId'>, event: string) {
+    if (!isDiagnosticsEnabled()) return;
+    console.log(
+      `[QD][CUSTOMER] clientId=${shortId(cust.clientId)} peerId=${shortId(cust.peerId)} customerCode=${cust.customerCode} batchId=${shortId(cust.batchId)} event=${event}`,
+    );
+  }
+
+  /** `[QD][WEBRTC] clientId= peerId= connectionState=` */
+  private logWebrtc(clientId: string, peerId: string, connectionState: string) {
+    if (!isDiagnosticsEnabled()) return;
+    console.log(
+      `[QD][WEBRTC] clientId=${shortId(clientId)} peerId=${shortId(peerId)} connectionState=${connectionState}`,
+    );
+  }
+
+  /** `[QD][WS] clientId= peerId= event=` */
+  private logWs(clientId: string | undefined, peerId: string | undefined, event: string) {
+    if (!isDiagnosticsEnabled()) return;
+    console.log(`[QD][WS] clientId=${shortId(clientId)} peerId=${shortId(peerId)} event=${event}`);
+  }
+
+  /**
+   * Recompute batchStatus from the customer's own transfers + documents. Derived, so
+   * it can never disagree with the queue about whether work is outstanding.
+   */
+  private refreshBatchStatus(cust: CustomerSession) {
+    if (cust.batchStatus === 'COMPLETED') return;
+    let inFlight = false;
+    for (const lease of this.leases.values()) {
+      if (lease.clientId === cust.clientId && lease.state !== 'FINALIZED') {
+        inFlight = true;
+        break;
+      }
+    }
+    cust.batchStatus = inFlight
+      ? 'RECEIVING'
+      : cust.documents.size > 0
+        ? 'READY_TO_PRINT'
+        : 'EMPTY';
   }
 
   // ─── Signaling listeners ────────────────────────────────────────────────────
@@ -137,12 +224,14 @@ export class ShopPeerManager {
 
   private onPeerJoined = (data: Parameters<SignalingEventMap['peer_joined']>[0]) => {
     if (data.role === 'customer' && data.customer) {
+      this.logWs(data.customer.clientId, data.peerId, 'PEER_JOINED');
       this.handleCustomerJoined(data.peerId, data.customer);
     }
   };
 
   private onPeerLeft = (data: Parameters<SignalingEventMap['peer_left']>[0]) => {
     if (data.role === 'customer') {
+      this.logWs(data.clientId, data.peerId, 'PEER_LEFT');
       this.handleCustomerLeftByPeerId(data.peerId, data.clientId);
     }
   };
@@ -150,7 +239,23 @@ export class ShopPeerManager {
   private onCustomerUpdatedEvent = (data: Parameters<SignalingEventMap['customer_updated']>[0]) => {
     const cust = this.customers.get(data.clientId || "");
     if (cust) {
+      this.logWs(data.clientId, data.peerId, 'CUSTOMER_UPDATED');
       cust.displayName = data.displayName;
+      this.events.onCustomerUpdated?.(cust);
+    }
+  };
+
+  /**
+   * The customer says its batch is done. Advisory only — it changes how the batch is
+   * labelled for the operator and never touches the queue, so a malicious or buggy
+   * customer cannot release another customer's slot with it.
+   */
+  private onBatchCompletedEvent = (data: Parameters<SignalingEventMap['batch_completed']>[0]) => {
+    const cust = this.customers.get(data.clientId || '');
+    if (!cust) return;
+    this.logWs(data.clientId, data.peerId, 'BATCH_COMPLETED');
+    if (cust.documents.size > 0) {
+      cust.batchStatus = 'COMPLETED';
       this.events.onCustomerUpdated?.(cust);
     }
   };
@@ -159,12 +264,14 @@ export class ShopPeerManager {
     this.signaling.on('peer_joined', this.onPeerJoined);
     this.signaling.on('peer_left', this.onPeerLeft);
     this.signaling.on('customer_updated', this.onCustomerUpdatedEvent);
+    this.signaling.on('batch_completed', this.onBatchCompletedEvent);
   }
 
   private teardownSignalingListeners() {
     this.signaling.off('peer_joined', this.onPeerJoined);
     this.signaling.off('peer_left', this.onPeerLeft);
     this.signaling.off('customer_updated', this.onCustomerUpdatedEvent);
+    this.signaling.off('batch_completed', this.onBatchCompletedEvent);
   }
 
   /** Update the ICE servers used for peers created from here on (in place). */
@@ -199,14 +306,14 @@ export class ShopPeerManager {
   private requestTransferSlot(
     clientId: string,
     transferId: string,
-    accept: () => void,
+    accept: () => boolean | void,
     notifyCancel: (reason: string) => void,
   ) {
     const existing = this.leases.get(transferId);
     if (existing) {
       // Duplicate FILE_OFFER for a transferId we already track — never allow a
       // second lease for the same id (that would let one file take two slots).
-      this.log(`[QUEUE] duplicate offer ignored transfer=${shortId(transferId)} state=${existing.state}`);
+      this.logTransfer(clientId, transferId, `DUPLICATE_OFFER_IGNORED(${existing.state})`);
       return;
     }
 
@@ -219,7 +326,11 @@ export class ShopPeerManager {
       watchdog: null,
     });
     this.queueOrder.push(transferId);
-    this.log(`[QUEUE] enqueue transfer=${shortId(transferId)} client=${shortId(clientId)} depth=${this.getQueuedTransferIds().length}`);
+    this.logTransfer(clientId, transferId, 'QUEUED');
+    this.logQueue();
+
+    const cust = this.customers.get(clientId);
+    if (cust) this.refreshBatchStatus(cust);
 
     this.tryDequeue();
   }
@@ -241,11 +352,11 @@ export class ShopPeerManager {
   private releaseLease(transferId: string, reason: TransferTerminalReason): boolean {
     const lease = this.leases.get(transferId);
     if (!lease) {
-      this.log(`[QUEUE] finalize ignored (unknown) transfer=${shortId(transferId)} reason=${reason}`);
+      this.log(`[QD][QUEUE] finalize ignored (unknown) transfer=${shortId(transferId)} reason=${reason}`);
       return false;
     }
     if (lease.state === 'FINALIZED') {
-      this.log(`[QUEUE] finalize ignored (already final) transfer=${shortId(transferId)} reason=${reason}`);
+      this.log(`[QD][QUEUE] finalize ignored (already final) transfer=${shortId(transferId)} reason=${reason}`);
       return false;
     }
 
@@ -253,12 +364,11 @@ export class ShopPeerManager {
     lease.state = 'FINALIZED';
     this.clearWatchdog(lease);
 
-    this.log(
-      `[TRANSFER] finalize transfer=${shortId(transferId)} client=${shortId(lease.clientId)} reason=${reason} wasActive=${wasActive}`,
-    );
-    if (wasActive) {
-      this.log(`[QUEUE] release transfer=${shortId(transferId)} active=${this.getActiveTransferCount()}`);
-    }
+    this.logTransfer(lease.clientId, transferId, `FINALIZED(${reason}) wasActive=${wasActive}`);
+    if (wasActive) this.logQueue('released=' + shortId(transferId));
+
+    const cust = this.customers.get(lease.clientId);
+    if (cust) this.refreshBatchStatus(cust);
     return true;
   }
 
@@ -291,7 +401,7 @@ export class ShopPeerManager {
 
       const cust = this.customers.get(lease.clientId);
       if (!cust || cust.connectionState === 'DISCONNECTED') {
-        this.log(`[QUEUE] skip transfer=${shortId(transferId)} reason=customer_gone`);
+        this.logTransfer(lease.clientId, transferId, 'SKIPPED(customer_gone)');
         this.releaseLease(transferId, 'PEER_DISCONNECTED');
         continue;
       }
@@ -304,15 +414,22 @@ export class ShopPeerManager {
   private activateLease(lease: TransferLease) {
     lease.state = 'ACTIVE';
     this.armWatchdog(lease);
-    this.log(
-      `[QUEUE] acquire transfer=${shortId(lease.transferId)} client=${shortId(lease.clientId)} active=${this.getActiveTransferCount()}`,
-    );
-    this.log(`[QUEUE] accept transfer=${shortId(lease.transferId)}`);
+    this.logTransfer(lease.clientId, lease.transferId, 'ACTIVE');
+    this.logQueue('activated=' + shortId(lease.transferId));
+    const cust = this.customers.get(lease.clientId);
+    if (cust) this.refreshBatchStatus(cust);
     try {
-      lease.accept();
+      // `false` means FILE_ACCEPT never left (dead channel — which does NOT throw).
+      // Treated exactly like a throw: the customer will never send a byte, so holding
+      // the slot for the watchdog's full timeout would stall everyone behind them.
+      if (lease.accept() === false) {
+        this.logTransfer(lease.clientId, lease.transferId, 'ACCEPT_SEND_FAILED');
+        this.releaseLease(lease.transferId, 'DATA_CHANNEL_CLOSED');
+        this.events.onError?.(lease.clientId, 'Could not start the transfer — connection lost.');
+      }
     } catch (err) {
       // If we cannot even send FILE_ACCEPT the slot must not stay held.
-      this.log(`[QUEUE] accept failed transfer=${shortId(lease.transferId)}`);
+      this.logTransfer(lease.clientId, lease.transferId, 'ACCEPT_SEND_FAILED');
       this.releaseLease(lease.transferId, 'NETWORK_ERROR');
       this.events.onError?.(lease.clientId, (err as Error)?.message || 'Failed to accept transfer');
     }
@@ -325,7 +442,7 @@ export class ShopPeerManager {
     lease.watchdog = setTimeout(() => {
       lease.watchdog = null;
       if (lease.state !== 'ACTIVE') return;
-      this.log(`[TRANSFER] timeout transfer=${shortId(lease.transferId)} (no activity for ${this.transferWatchdogMs}ms)`);
+      this.logTransfer(lease.clientId, lease.transferId, `WATCHDOG_TIMEOUT(${this.transferWatchdogMs}ms)`);
       // Tell the customer so its sender stops waiting instead of hanging.
       try {
         lease.notifyCancel('Shop transfer watchdog timeout — no data received.');
@@ -383,6 +500,10 @@ export class ShopPeerManager {
     if (existing) {
       // Reconnect: the old transport is dead, so any transfer still riding it is
       // terminal. Release those slots before we build the replacement peer.
+      // NOTE: `existing.documents` and `existing.transfers` are deliberately left
+      // untouched. A reconnect replaces the customer's TRANSPORT, never their
+      // history — losing documents here is precisely the attribution bug that real
+      // devices exposed.
       existing.connectionState = 'DISCONNECTED';
       this.finalizeLeasesForClient(clientId, 'PEER_DISCONNECTED');
       this.pruneFinalizedLeases(clientId);
@@ -400,7 +521,10 @@ export class ShopPeerManager {
       targetPeerId: peerId,
       onConnectionStateChange: (state) => {
         const c = this.customers.get(clientId);
+        // The peerId guard is what keeps a superseded peer's late callbacks from
+        // mutating the customer that replaced it.
         if (c && c.peerId === peerId) {
+          this.logWebrtc(clientId, peerId, state);
           c.connectionState = state === 'connected' ? 'CONNECTED' : state === 'failed' || state === 'disconnected' || state === 'closed' ? 'DISCONNECTED' : 'CONNECTING';
           this.events.onConnectionStateChange?.(clientId, c.connectionState);
           if (state === 'failed' || state === 'closed') {
@@ -439,8 +563,20 @@ export class ShopPeerManager {
               }
             },
             onFileReceived: (doc) => {
+              // Attribution is stamped HERE, at the only layer that knows both the
+              // document and the customer, and stored on the customer itself. The
+              // dashboard never has to work out who a document belongs to.
+              const shopDoc: ShopDocument = {
+                ...doc,
+                clientId,
+                batchId: c.batchId,
+                customerCode: c.customerCode,
+                displayName: c.displayName,
+              };
+              c.documents.set(shopDoc.documentId, shopDoc);
               this.finalizeTransfer(doc.transferId, 'COMPLETED');
-              this.events.onFileReceived?.(clientId, doc);
+              this.refreshBatchStatus(c);
+              this.events.onFileReceived?.(clientId, shopDoc);
             },
             onError: (transferId, error) => {
               // One choke point for every receiver-side failure: missing chunks,
@@ -468,6 +604,8 @@ export class ShopPeerManager {
     });
 
     if (existing) {
+      // Rebind the transport onto the SAME CustomerSession object. Identity,
+      // documents and transfer history all survive; only peerId/peer change.
       existing.peerId = peerId;
       existing.peer = peer;
       existing.connectionState = 'CONNECTING';
@@ -476,6 +614,8 @@ export class ShopPeerManager {
       if (customerData.displayName !== undefined) {
          existing.displayName = customerData.displayName;
       }
+      this.refreshBatchStatus(existing);
+      this.logCustomer(existing, 'RECONNECTED');
       this.events.onCustomerUpdated?.(existing);
     } else {
       const session: CustomerSession = {
@@ -483,13 +623,16 @@ export class ShopPeerManager {
         peerId,
         customerCode: customerData.customerCode,
         batchId: customerData.batchId,
+        batchStatus: 'EMPTY',
         displayName: customerData.displayName || null,
         connectionState: 'CONNECTING',
         peer,
         receiver: null,
         transfers: new Map(),
+        documents: new Map(),
       };
       this.customers.set(clientId, session);
+      this.logCustomer(session, 'JOINED');
       this.events.onCustomerJoined?.(session);
     }
 
@@ -529,14 +672,31 @@ export class ShopPeerManager {
       }
       cust.peer.close();
 
+      this.logCustomer(cust, 'DISCONNECTED');
+      this.refreshBatchStatus(cust);
       this.events.onConnectionStateChange?.(clientId, 'DISCONNECTED');
-      // We no longer delete the customer, so they stay in history if they have docs.
+      // The customer is NEVER deleted. clientId is the durable logical identity and
+      // its documents must outlive the transport; the dashboard keeps showing the
+      // card (greyed) rather than dropping the person and orphaning their files.
       this.events.onCustomerLeft?.(clientId);
     }
   }
 
   public getCustomers(): CustomerSession[] {
     return Array.from(this.customers.values());
+  }
+
+  public getCustomer(clientId: string): CustomerSession | undefined {
+    return this.customers.get(clientId);
+  }
+
+  /** Every document the shop holds, newest first, fully attributed. */
+  public getDocuments(): ShopDocument[] {
+    const all: ShopDocument[] = [];
+    for (const cust of this.customers.values()) {
+      for (const doc of cust.documents.values()) all.push(doc);
+    }
+    return all.sort((a, b) => b.receivedAt.getTime() - a.receivedAt.getTime());
   }
 
   public cleanup() {

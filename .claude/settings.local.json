@@ -4,7 +4,9 @@
       "Bash(git -C \"D:/Projects/QuickDrop\" rev-parse --is-inside-work-tree)",
       "Bash(npm test *)",
       "Bash(npx vitest *)",
-      "Bash(npm run *)"
+      "Bash(npm run *)",
+      "Bash(cp src/lib/webrtc/ShopPeerManager.ts /tmp/spm.bak)",
+      "Bash(perl -0pi -e 's/if \\\\\\(lease\\\\.accept\\\\\\(\\\\\\) === false\\\\\\) \\\\{/lease.accept\\(\\); if \\(false\\) {/' src/lib/webrtc/ShopPeerManager.ts)"
     ]
   }
 }

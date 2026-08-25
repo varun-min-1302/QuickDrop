@@ -8,6 +8,12 @@ import { computeSHA256 } from './hashing.js';
 import { transferTimings } from './timings.js';
 
 export interface ReceivedDocument {
+  /**
+   * Durable per-document key, derived from the transferId so it is stable and
+   * idempotent: re-finalizing the same transfer can never produce a second
+   * document. Documents are stored in a Map under this id, never by array index.
+   */
+  documentId: string;
   transferId: string;
   name: string;
   size: number;
@@ -16,6 +22,8 @@ export interface ReceivedDocument {
   file: File;
   objectUrl: string;
   receivedAt: Date;
+  /** Terminal state of the document as far as the shop is concerned. */
+  status: 'RECEIVED';
 }
 
 export interface FileReceiverCallbacks {
@@ -150,8 +158,11 @@ export class FileReceiver {
             msg,
             () => {
               // accept() — grant the slot. Guarded so a queue bug can't send two
-              // FILE_ACCEPTs (which would make the sender start twice).
-              if (responded || this.finalizedTransfers.has(msg.transferId)) return;
+              // FILE_ACCEPTs (which would make the sender start twice). Returns
+              // whether FILE_ACCEPT actually left, because a dead channel does NOT
+              // throw: the queue owner needs a real signal to release the slot with,
+              // or a departed customer's slot sits held until the watchdog fires.
+              if (responded || this.finalizedTransfers.has(msg.transferId)) return false;
               responded = true;
               transferTimings.mark(msg.transferId, 'acceptSentAt');
               this.callbacks.onProgress?.({
@@ -164,7 +175,7 @@ export class FileReceiver {
                 estimatedRemainingSec: 0,
                 status: 'RECEIVING',
               });
-              this.send({ type: 'FILE_ACCEPT', transferId: msg.transferId });
+              return this.send({ type: 'FILE_ACCEPT', transferId: msg.transferId });
             },
             () => {
               // wait() — tell the sender to hold. Does not close the accept path:
@@ -312,6 +323,7 @@ export class FileReceiver {
       const objectUrl = URL.createObjectURL(blob);
 
       const receivedDoc: ReceivedDocument = {
+        documentId: `doc_${transferId}`,
         transferId,
         name: transfer.meta.name,
         size: transfer.meta.size,
@@ -320,6 +332,7 @@ export class FileReceiver {
         file,
         objectUrl,
         receivedAt: new Date(),
+        status: 'RECEIVED',
       };
 
       // Mark terminal BEFORE notifying, so a late FILE_END or TRANSFER_CANCEL that

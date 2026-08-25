@@ -1,6 +1,7 @@
 import { IceServerConfig } from '@quickdrop/shared';
 import { SignalingClient } from './signalingClient.js';
 import { WebRTCPeer } from './peerConnection.js';
+import { isDiagnosticsEnabled } from '../diagnostics.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -72,6 +73,7 @@ export class ConnectionAttempt {
   // ─── Helpers ────────────────────────────────────────────────────────────────
 
   private log(msg: string) {
+    if (!isDiagnosticsEnabled()) return;
     console.log(`[QuickDrop][CONNECT][attempt=${this.options.attemptId}] ${msg}`);
   }
 

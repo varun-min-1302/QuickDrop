@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { parseAndValidateQuickDropQr } from '../lib/qr/qrValidator.js';
 
 describe('In-Browser QR Validation & Security Rules', () => {
-  const currentOrigin = 'https://4542-202-53-15-75.ngrok-free.app';
+  const currentOrigin = 'https://quickdrop.app';
 
   it('recognizes valid QuickDrop full URL with hash fragment', () => {
     const validUrl = `${currentOrigin}/#abc123token-secret-999`;
@@ -72,7 +72,7 @@ describe('In-Browser QR Validation & Security Rules', () => {
 });
 
 describe('Permanent shop QR (/s/:publicShopId) validation', () => {
-  const currentOrigin = 'https://4542-202-53-15-75.ngrok-free.app';
+  const currentOrigin = 'https://quickdrop.app';
   const PID = 'QD-7F82A9';
 
   it('recognizes an absolute permanent-shop URL and classifies it as a shop QR', () => {

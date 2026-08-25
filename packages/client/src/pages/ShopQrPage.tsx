@@ -40,7 +40,8 @@ export const ShopQrPage: React.FC = () => {
     };
   }, []);
 
-  const qrUrl = shop ? buildShopQrUrl(window.location.origin, shop.publicShopId) : '';
+  const qrOrigin = (import.meta as { env?: { VITE_PUBLIC_APP_URL?: string } }).env?.VITE_PUBLIC_APP_URL || window.location.origin;
+  const qrUrl = shop ? buildShopQrUrl(qrOrigin, shop.publicShopId) : '';
 
   useEffect(() => {
     if (canvasRef.current && qrUrl) {

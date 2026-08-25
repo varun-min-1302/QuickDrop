@@ -4,7 +4,6 @@ import {
   apiRequest,
   buildHeaders,
   defaultMessageForStatus,
-  isDev,
 } from '../lib/api/http.js';
 import { registerOwner, loginOwner, logoutOwner, fetchMe } from '../lib/api/auth.js';
 import { authReducer, initialAuthState } from '../auth/authState.js';
@@ -35,15 +34,11 @@ afterEach(() => {
 });
 
 describe('http helpers (pure)', () => {
-  it('buildHeaders: Accept always; Content-Type only with a body; ngrok header only in dev', () => {
-    expect(buildHeaders(false, false)).toEqual({ Accept: 'application/json' });
-    expect(buildHeaders(true, false)).toEqual({
+  it('buildHeaders: Accept always; Content-Type only with a body', () => {
+    expect(buildHeaders(false)).toEqual({ Accept: 'application/json' });
+    expect(buildHeaders(true)).toEqual({
       Accept: 'application/json',
       'Content-Type': 'application/json',
-    });
-    expect(buildHeaders(false, true)).toEqual({
-      Accept: 'application/json',
-      'ngrok-skip-browser-warning': 'true',
     });
   });
 
@@ -56,11 +51,6 @@ describe('http helpers (pure)', () => {
     expect(defaultMessageForStatus(500)).toMatch(/server/i);
     // Never leaks internals.
     expect(defaultMessageForStatus(418)).not.toMatch(/stack|trace|undefined/i);
-  });
-
-  it('isDev never throws (safe in the Node test env)', () => {
-    expect(() => isDev()).not.toThrow();
-    expect(typeof isDev()).toBe('boolean');
   });
 });
 

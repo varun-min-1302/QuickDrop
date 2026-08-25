@@ -6,7 +6,8 @@ import { ExternalLink, Printer, Download, Trash2, CheckCircle2, FileText, Image,
 
 interface ReceivedFileCardProps {
   document: ReceivedDocument;
-  onDelete?: (transferId: string) => void;
+  /** Receives the durable documentId, not the transferId. */
+  onDelete?: (documentId: string) => void;
 }
 
 export const ReceivedFileCard: React.FC<ReceivedFileCardProps> = ({ document, onDelete }) => {
@@ -115,7 +116,7 @@ export const ReceivedFileCard: React.FC<ReceivedFileCardProps> = ({ document, on
 
         {onDelete && (
           <button
-            onClick={() => onDelete(document.transferId)}
+            onClick={() => onDelete(document.documentId)}
             className="flex h-8 w-8 items-center justify-center rounded-full text-text-muted hover:bg-error-container hover:text-error transition-all btn-tactile"
             title="Delete from browser"
           >

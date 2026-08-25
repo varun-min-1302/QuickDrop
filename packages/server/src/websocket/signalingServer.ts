@@ -34,9 +34,21 @@ export interface CustomerConnection {
 
 export class SignalingManager {
   private peers = new Map<string, ConnectedPeer>(); // connectionId -> ConnectedPeer
-  private sessionPeers = new Map<string, { 
-    shopPeerId?: string; 
+  private sessionPeers = new Map<string, {
+    shopPeerId?: string;
     customers: Map<string, CustomerConnection>; // Keyed by customer peerId
+    /**
+     * Customers whose socket has gone away, keyed by the DURABLE clientId.
+     *
+     * peerId is ephemeral — a new one is minted per WebSocket — but customerCode and
+     * batchId are the customer's visible identity and must survive a drop. Without
+     * this, a phone whose dead socket had already been reaped by the heartbeat
+     * rejoined as a brand-new customer: same clientId, *different* customerCode and
+     * batchId. The dashboard then showed a second card and every document already
+     * attributed to the old code was orphaned. Retained for the session's lifetime
+     * only (the session store is ephemeral and expires with the session).
+     */
+    retired: Map<string, { customerCode: string; batchId: string; displayName: string | null }>;
   }>();
   private sessionStore: ISessionStore;
   private heartbeatInterval?: NodeJS.Timeout;
@@ -279,7 +291,7 @@ export class SignalingManager {
     peer.clientId = msg.clientId;
 
     if (!this.sessionPeers.has(sessionId)) {
-      this.sessionPeers.set(sessionId, { customers: new Map() });
+      this.sessionPeers.set(sessionId, { customers: new Map(), retired: new Map() });
     }
     const sessionGroup = this.sessionPeers.get(sessionId)!;
 
@@ -349,12 +361,12 @@ export class SignalingManager {
           existingPeer.socket.terminate();
           this.peers.delete(existingPeer.connectionId);
         }
-        
+
         const oldConn = sessionGroup.customers.get(existingCustomerPeerId)!;
         customerCode = oldConn.customerCode;
         batchId = oldConn.batchId;
         displayName = oldConn.displayName;
-        
+
         sessionGroup.customers.delete(existingCustomerPeerId);
 
         // Notify shop that the old peer left, so it can clean up before the new one joins
@@ -369,6 +381,18 @@ export class SignalingManager {
             });
           }
         }
+      } else if (msg.clientId && sessionGroup.retired.has(msg.clientId)) {
+        // Returning customer whose previous socket was already reaped (heartbeat
+        // timeout, phone sleep, browser refresh). The live map no longer holds them,
+        // but their identity must be restored verbatim — a fresh customerCode/batchId
+        // here is what made the same person appear as a second customer on the
+        // dashboard and orphaned every document already filed under the old code.
+        const retired = sessionGroup.retired.get(msg.clientId)!;
+        customerCode = retired.customerCode;
+        batchId = retired.batchId;
+        displayName = retired.displayName;
+        sessionGroup.retired.delete(msg.clientId);
+        await this.sessionStore.updateCustomerCount(sessionId, 1);
       } else {
         // Enforce max capacity (e.g., 50 customers limit)
         // Since we import LIMITS, we can use 50 hardcoded or add it to LIMITS.
@@ -383,10 +407,14 @@ export class SignalingManager {
         }
 
         // New connection
-        // Generate unique customer code
+        // Generate a customer code that collides with neither a live customer nor a
+        // retired one — a retired code still belongs to whoever may come back for it.
         do {
           customerCode = generateCustomerCode();
-        } while (Array.from(sessionGroup.customers.values()).some(c => c.customerCode === customerCode));
+        } while (
+          Array.from(sessionGroup.customers.values()).some((c) => c.customerCode === customerCode) ||
+          Array.from(sessionGroup.retired.values()).some((c) => c.customerCode === customerCode)
+        );
         batchId = `batch_${crypto.randomUUID()}`;
 
         await this.sessionStore.updateCustomerCount(sessionId, 1);
@@ -415,29 +443,38 @@ export class SignalingManager {
         batchId,
       });
 
-      // Notify shop that this customer joined
-      if (sessionGroup.shopPeerId) {
-        const shopPeer = this.getPeerById(sessionGroup.shopPeerId);
-        if (shopPeer && shopPeer.socket.readyState === WebSocket.OPEN) {
-          this.sendMessage(shopPeer.socket, {
-            type: 'PEER_JOINED',
-            peerId: peer.peerId,
-            role: 'customer',
-            customer: {
-              clientId: customerConn.clientId,
-              customerCode,
-              displayName,
-              batchId,
-            },
-          });
+      // Tell the shop this customer joined, and tell the customer the shop is
+      // present. These two sends used to be nested inside a single readyState check,
+      // so whenever `shopPeerId` pointed at a peer that had already gone the joining
+      // customer received nothing at all and sat in WAITING_FOR_SHOP for its full
+      // 15s budget before failing with "The shop is not ready yet". A customer that
+      // genuinely arrives before the shop is covered by the shop-JOIN broadcast.
+      const shopPeer = sessionGroup.shopPeerId ? this.getPeerById(sessionGroup.shopPeerId) : undefined;
+      if (sessionGroup.shopPeerId && !shopPeer) {
+        // Stale pointer: the shop's connection is gone but its close handler has not
+        // run (or ran for a superseded connection). Clear it rather than let it
+        // mislead the next joiner too.
+        sessionGroup.shopPeerId = undefined;
+      }
 
-          // Also notify customer of shop peer presence
-          this.sendMessage(peer.socket, {
-            type: 'PEER_JOINED',
-            peerId: shopPeer.peerId,
-            role: 'shop',
-          });
-        }
+      if (shopPeer && shopPeer.socket.readyState === WebSocket.OPEN) {
+        this.sendMessage(shopPeer.socket, {
+          type: 'PEER_JOINED',
+          peerId: peer.peerId,
+          role: 'customer',
+          customer: {
+            clientId: customerConn.clientId,
+            customerCode,
+            displayName,
+            batchId,
+          },
+        });
+
+        this.sendMessage(peer.socket, {
+          type: 'PEER_JOINED',
+          peerId: shopPeer.peerId,
+          role: 'shop',
+        });
       }
     }
   }
@@ -538,7 +575,17 @@ export class SignalingManager {
           const customerConn = sessionGroup.customers.get(peer.peerId);
           sessionGroup.customers.delete(peer.peerId);
           this.sessionStore.updateCustomerCount(peer.sessionId, -1);
-          
+
+          // Preserve the durable identity so a rejoin with the same clientId gets its
+          // original customerCode/batchId back instead of appearing as a new customer.
+          if (customerConn?.clientId) {
+            sessionGroup.retired.set(customerConn.clientId, {
+              customerCode: customerConn.customerCode,
+              batchId: customerConn.batchId,
+              displayName: customerConn.displayName,
+            });
+          }
+
           if (sessionGroup.shopPeerId) {
             const shopPeer = this.getPeerById(sessionGroup.shopPeerId);
             if (shopPeer && shopPeer.socket.readyState === WebSocket.OPEN) {

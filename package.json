@@ -16,11 +16,9 @@
     "typecheck": "npm run typecheck --workspaces",
     "dev:server": "npm run dev --workspace=packages/server",
     "dev:client": "npm run dev --workspace=packages/client",
-    "dev": "concurrently \"npm run dev:server\" \"npm run dev:client\"",
-    "tunnel": "node scripts/tunnel.js"
+    "dev": "concurrently \"npm run dev:server\" \"npm run dev:client\""
   },
   "devDependencies": {
-    "@ngrok/ngrok": "^1.7.0",
     "concurrently": "^9.1.2",
     "typescript": "^5.8.2",
     "vitest": "^3.0.7"

@@ -35,7 +35,7 @@ export function setAuthCookie(reply: FastifyReply, token: string, opts: AuthCook
   reply.setCookie(AUTH_COOKIE_NAME, token, {
     httpOnly: true,
     secure: opts.secure,
-    sameSite: 'lax',
+    sameSite: opts.secure ? 'none' : 'lax',
     path: '/',
     signed: true,
     maxAge: opts.maxAgeSeconds,
@@ -47,7 +47,7 @@ export function clearAuthCookie(reply: FastifyReply, secure: boolean): void {
   reply.clearCookie(AUTH_COOKIE_NAME, {
     httpOnly: true,
     secure,
-    sameSite: 'lax',
+    sameSite: secure ? 'none' : 'lax',
     path: '/',
     signed: true,
   });

@@ -10,9 +10,24 @@ import { QrScannerModal } from '../components/QrScannerModal.js';
 import type { QrScanResult } from '../lib/qr/qrValidator.js';
 import {
   Send, CheckCircle2, ShieldCheck, RefreshCw, AlertCircle,
-  KeyRound, ArrowRight, RotateCcw, Clock, Camera,
+  KeyRound, ArrowRight, RotateCcw, Clock, Camera, AlertTriangle,
 } from 'lucide-react';
 import { ConnectionAttempt, ConnectionStage } from '../lib/webrtc/ConnectionAttempt.js';
+import { isDiagnosticsEnabled } from '../lib/diagnostics.js';
+import {
+  BatchFileEntry,
+  addFiles,
+  applyProgress,
+  attachReselectedFiles,
+  describeReselect,
+  markFailed,
+  parsePersistedBatch,
+  removeFile,
+  reselectRequiredEntries,
+  restoreBatchEntries,
+  sendableEntries,
+  serializeBatch,
+} from '../lib/transfer/customerBatch.js';
 
 // ─── Workflow state ────────────────────────────────────────────────────────────
 
@@ -51,6 +66,8 @@ const SS = {
   NUMERIC: 'quickdrop_customer_numeric',
   BATCH: 'quickdrop_customer_batch',
   NAME: 'quickdrop_customer_name',
+  /** Batch state: metadata and per-file status only. Never document bytes. */
+  BATCH_STATE: 'quickdrop_customer_batch_state',
 } as const;
 
 function clearSessionData() {
@@ -60,6 +77,35 @@ function clearSessionData() {
   sessionStorage.removeItem(SS.NUMERIC);
   sessionStorage.removeItem(SS.BATCH);
   sessionStorage.removeItem(SS.NAME);
+  sessionStorage.removeItem(SS.BATCH_STATE);
+}
+
+/**
+ * `[QD]` diagnostics, gated by the shared {@link isDiagnosticsEnabled} switch — a dev
+ * build, or `?qdlog=1` / `localStorage.quickdrop_debug=1` on a production one. Real-device
+ * failures are invisible without a trace of the identity a phone is using, so these mirror
+ * the shop-side tags, but they never ship as always-on production logging.
+ */
+function logCustomer(event: string, fields: Record<string, string | number | null | undefined>) {
+  if (!isDiagnosticsEnabled()) return;
+  const rendered = Object.entries(fields)
+    .map(([key, value]) => `${key}=${value ?? '-'}`)
+    .join(' ');
+  console.log(`[QD][CUSTOMER] ${rendered} event=${event}`);
+}
+
+function logTransferState(fields: {
+  clientId: string | null;
+  batchId: string;
+  transferId: string | null;
+  fileName: string;
+  state: string;
+}) {
+  if (!isDiagnosticsEnabled()) return;
+  console.log(
+    `[QD][TRANSFER] clientId=${fields.clientId ?? '-'} batchId=${fields.batchId || '-'} ` +
+      `transferId=${fields.transferId ?? '-'} fileName=${fields.fileName} state=${fields.state}`
+  );
 }
 
 // ─── Component ────────────────────────────────────────────────────────────────
@@ -86,8 +132,13 @@ export const CustomerTransferPage: React.FC<CustomerTransferPageProps> = ({
   const [workflowState, setWorkflowState] = useState<CustomerWorkflowState>('INITIALIZING');
   const [connectionState, setConnectionState] = useState<AppConnectionState>('INITIALIZING');
   const [connectionStage, setConnectionStage] = useState<ConnectionStage>('IDLE');
-  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
-  const [transferProgresses, setTransferProgresses] = useState<TransferProgress[]>([]);
+  /**
+   * The batch: one entry per document, keyed by a durable fileId. Replaces the old
+   * `selectedFiles: File[]` + `transferProgresses: TransferProgress[]` pair, whose
+   * shared array index silently coupled unrelated documents and could not survive a
+   * refresh.
+   */
+  const [batchEntries, setBatchEntries] = useState<BatchFileEntry[]>([]);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [isScannerOpen, setIsScannerOpen] = useState(false);
   const [customerCode, setCustomerCode] = useState<string>('');
@@ -103,10 +154,34 @@ export const CustomerTransferPage: React.FC<CustomerTransferPageProps> = ({
   const activeSenderRef = useRef<FileSender | null>(null);
   // Active signaling client — kept so identity-phase calls (updateCustomer, batchCompleted) work
   const signalingClientRef = useRef<import('../lib/webrtc/signalingClient.js').SignalingClient | null>(null);
+  /** Live mirror of the batch, so the send loop never reads a stale closure. */
+  const entriesRef = useRef<BatchFileEntry[]>([]);
+  /** Last batchId the server assigned, compared outside React state (see adoptBatchId). */
+  const batchIdRef = useRef<string>('');
 
   // ── Attempt tracking (stale-callback protection) ──────────────────────────
   const attemptIdRef = useRef<number>(0);
   const activeAttemptRef = useRef<ConnectionAttempt | null>(null);
+
+  /**
+   * Take on the batchId the server assigned.
+   *
+   * A refresh or a dropped socket returns the SAME batchId (the server keeps a retired
+   * clientId → code/batch record), so the restored batch — completed rows included —
+   * carries straight over. A genuinely NEW batchId means a different batch: rows that
+   * are already terminal belong to the old one and must not be presented as part of
+   * this one, while files the customer picked and never sent are still theirs to send.
+   */
+  const adoptBatchId = useCallback((incoming: string) => {
+    if (!incoming) return;
+    const previous = batchIdRef.current;
+    batchIdRef.current = incoming;
+    setBatchId(incoming);
+    if (previous && previous !== incoming) {
+      setBatchEntries((prev) => prev.filter((e) => e.status === 'PENDING' && e.file !== null));
+      setIsBatchCompleted(false);
+    }
+  }, []);
 
   // ─── startNewAttempt ────────────────────────────────────────────────────────
 
@@ -143,16 +218,17 @@ export const CustomerTransferPage: React.FC<CustomerTransferPageProps> = ({
       callbacks: {
         onStageChange: (stage) => {
           if (!isCurrentAttempt()) return;
-          console.log(`[QuickDrop][UI] stage=${stage}`);
+          if (isDiagnosticsEnabled()) console.log(`[QuickDrop][UI] stage=${stage}`);
           setConnectionStage(stage);
         },
 
         onSessionData: (code, batch) => {
           if (!isCurrentAttempt()) return;
           setCustomerCode(code);
-          setBatchId(batch);
+          adoptBatchId(batch);
           sessionStorage.setItem(SS.CODE, code);
           sessionStorage.setItem(SS.BATCH, batch);
+          logCustomer('session_data', { clientId, customerCode: code, batchId: batch });
         },
 
         onConnected: (channel, code, batch) => {
@@ -166,11 +242,12 @@ export const CustomerTransferPage: React.FC<CustomerTransferPageProps> = ({
             sessionStorage.setItem(SS.CODE, code);
           }
           if (batch) {
-            setBatchId(batch);
+            adoptBatchId(batch);
             sessionStorage.setItem(SS.BATCH, batch);
           }
 
           setConnectionState('READY');
+          logCustomer('connected', { clientId, customerCode: code, batchId: batch });
 
           const storedName = sessionStorage.getItem(SS.NAME);
           setWorkflowState(storedName !== null ? 'BATCH_VIEW' : 'IDENTITY_PROMPT');
@@ -214,12 +291,14 @@ export const CustomerTransferPage: React.FC<CustomerTransferPageProps> = ({
     // but we need the attempt object to call abort cleanly
     activeAttemptRef.current = attempt;
     attempt.start();
-  }, []);
+  }, [adoptBatchId]);
 
   // ─── Boot ───────────────────────────────────────────────────────────────────
 
   useEffect(() => {
-    // Ensure stable clientId for this browser tab
+    // Ensure stable clientId for this browser tab. This is the DURABLE customer
+    // identity: reusing it on rejoin is what lets the server hand back the same
+    // customerCode and batchId instead of minting a second logical customer.
     let clientId = sessionStorage.getItem(SS.CLIENT_ID);
     if (!clientId) {
       clientId = crypto.randomUUID();
@@ -234,13 +313,47 @@ export const CustomerTransferPage: React.FC<CustomerTransferPageProps> = ({
     const storedName = sessionStorage.getItem(SS.NAME);
 
     if (storedCode) setCustomerCode(storedCode);
-    if (storedBatch) setBatchId(storedBatch);
+    if (storedBatch) {
+      setBatchId(storedBatch);
+      batchIdRef.current = storedBatch;
+    }
     if (storedName) setDisplayName(storedName);
+
+    // Restore the batch itself. Identity and per-file status come back; the File
+    // handles cannot, so anything unfinished is surfaced as FILE_RESELECT_REQUIRED
+    // instead of a row that would sit at 0 B forever.
+    const snapshot = parsePersistedBatch(sessionStorage.getItem(SS.BATCH_STATE));
+    if (snapshot && snapshot.clientId === clientId) {
+      const restored = restoreBatchEntries(snapshot.files);
+      setBatchEntries(restored);
+      entriesRef.current = restored;
+      if (snapshot.isBatchCompleted) setIsBatchCompleted(true);
+      if (!storedCode && snapshot.customerCode) setCustomerCode(snapshot.customerCode);
+      if (!storedBatch && snapshot.batchId) {
+        setBatchId(snapshot.batchId);
+        batchIdRef.current = snapshot.batchId;
+      }
+      if (storedName === null && snapshot.displayName !== null) setDisplayName(snapshot.displayName);
+      logCustomer('restored_batch', {
+        clientId,
+        customerCode: snapshot.customerCode,
+        batchId: snapshot.batchId,
+        files: restored.length,
+        reselect: reselectRequiredEntries(restored).length,
+      });
+    }
 
     if (hash) {
       // Strip token from address bar for privacy
       try { window.history.replaceState(null, '', window.location.pathname); } catch {}
     }
+
+    logCustomer('boot', {
+      clientId,
+      customerCode: storedCode,
+      batchId: storedBatch,
+      entry: initialNumericCode ? 'shop_qr' : hash ? 'token_hash' : storedToken ? 'reconnect' : 'idle',
+    });
 
     if (initialNumericCode) {
       // Permanent-QR bridge entry (§16): the /connect endpoint already routed us to the
@@ -264,6 +377,35 @@ export const CustomerTransferPage: React.FC<CustomerTransferPageProps> = ({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [startNewAttempt]);
+
+  /**
+   * Mirror the batch into sessionStorage on every change — metadata and status only.
+   * `entriesRef` is updated in the same pass so the send loop always sees current state.
+   */
+  useEffect(() => {
+    entriesRef.current = batchEntries;
+    const clientId = sessionStorage.getItem(SS.CLIENT_ID);
+    if (!clientId) return;
+    try {
+      sessionStorage.setItem(
+        SS.BATCH_STATE,
+        JSON.stringify(
+          serializeBatch({
+            clientId,
+            customerCode,
+            batchId,
+            displayName: displayName || null,
+            numericCode: sessionStorage.getItem(SS.NUMERIC),
+            token: sessionStorage.getItem(SS.TOKEN),
+            isBatchCompleted,
+            entries: batchEntries,
+          })
+        )
+      );
+    } catch {
+      /* Storage full or blocked — the live session still works, only refresh recovery is lost. */
+    }
+  }, [batchEntries, customerCode, batchId, displayName, isBatchCompleted]);
 
   // ─── Event handlers ─────────────────────────────────────────────────────────
 
@@ -332,11 +474,25 @@ export const CustomerTransferPage: React.FC<CustomerTransferPageProps> = ({
   };
 
   const handleFilesSelected = (files: File[]) => {
-    setSelectedFiles((prev) => [...prev, ...files]);
+    setBatchEntries((prev) => {
+      // If anything is waiting to be reselected, a matching pick re-attaches to that
+      // existing row (same fileId) instead of creating a duplicate document.
+      if (reselectRequiredEntries(prev).length > 0) {
+        const { entries, matched, added } = attachReselectedFiles(prev, files);
+        logCustomer('files_reselected', {
+          clientId: sessionStorage.getItem(SS.CLIENT_ID),
+          batchId,
+          matched,
+          added,
+        });
+        return entries;
+      }
+      return addFiles(prev, files);
+    });
   };
 
-  const handleRemoveFile = (index: number) => {
-    setSelectedFiles((prev) => prev.filter((_, i) => i !== index));
+  const handleRemoveFile = (fileId: string) => {
+    setBatchEntries((prev) => removeFile(prev, fileId));
   };
 
   const handleIdentitySubmit = (e: React.FormEvent) => {
@@ -351,64 +507,56 @@ export const CustomerTransferPage: React.FC<CustomerTransferPageProps> = ({
   const handleDoneSending = () => {
     setIsBatchCompleted(true);
     signalingClientRef.current?.batchCompleted();
+    logCustomer('batch_completed', {
+      clientId: sessionStorage.getItem(SS.CLIENT_ID),
+      customerCode,
+      batchId,
+      sent: batchEntries.filter((e) => e.status === 'COMPLETED').length,
+    });
   };
 
   const handleSendDocuments = async () => {
-    if (selectedFiles.length === 0 || selectedFiles.length === transferProgresses.length) return;
+    // Snapshot the queue up front, by fileId. Each file keeps its own identity for the
+    // whole send, so a failure or a removal cannot shift another file's progress row.
+    const queue = sendableEntries(entriesRef.current);
+    if (queue.length === 0) return;
 
     setErrorMsg(null);
     setWorkflowState('SENDING');
     setConnectionState('TRANSFERRING');
     isTransferringRef.current = true;
 
-    const initialProgresses: TransferProgress[] = [...transferProgresses];
-    const startIndex = transferProgresses.length;
+    const clientId = sessionStorage.getItem(SS.CLIENT_ID);
 
-    for (let i = startIndex; i < selectedFiles.length; i++) {
-      initialProgresses[i] = {
-        transferId: crypto.randomUUID(),
-        fileName: selectedFiles[i].name,
-        fileSize: selectedFiles[i].size,
-        transferredBytes: 0,
-        percentage: 0,
-        speedBytesPerSec: 0,
-        estimatedRemainingSec: 0,
-        status: 'QUEUED',
-      };
-    }
-    setTransferProgresses(initialProgresses);
-
-    /** Never leave a file sitting in QUEUED: give it an explicit terminal row. */
-    const markFailed = (index: number, file: File, error: string) => {
-      setTransferProgresses((prev) => {
-        const updated = [...prev];
-        const existing = updated[index];
-        updated[index] = {
-          transferId: existing?.transferId ?? crypto.randomUUID(),
-          fileName: file.name,
-          fileSize: file.size,
-          transferredBytes: existing?.transferredBytes ?? 0,
-          percentage: existing?.percentage ?? 0,
-          speedBytesPerSec: 0,
-          estimatedRemainingSec: 0,
-          status: 'FAILED',
-          error,
-        };
-        return updated;
-      });
-    };
+    // Show every file as QUEUED immediately: the shop admits one transfer at a time, so
+    // the rest genuinely are waiting in its queue, and saying so is the honest state.
+    setBatchEntries((prev) =>
+      prev.map((entry) =>
+        queue.some((q) => q.fileId === entry.fileId)
+          ? { ...entry, status: 'QUEUED', percentage: 0, transferredBytes: 0, error: undefined }
+          : entry
+      )
+    );
 
     let succeeded = 0;
     let failed = 0;
 
     try {
-      for (let i = startIndex; i < selectedFiles.length; i++) {
-        const file = selectedFiles[i];
+      for (const queued of queue) {
+        const file = queued.file;
+        if (!file) {
+          // Should be impossible (sendableEntries filters on a live handle) but a missing
+          // handle must still produce a terminal row, never a silent stall.
+          setBatchEntries((prev) => markFailed(prev, queued.fileId, 'File needs to be selected again.'));
+          failed++;
+          continue;
+        }
 
         // If the link itself is gone, no later file can succeed either — fail the
         // remainder explicitly rather than leaving them "Waiting in Queue".
         if (dataChannelRef.current?.readyState !== 'open') {
-          markFailed(i, file, 'Connection to the shop was lost.');
+          setBatchEntries((prev) => markFailed(prev, queued.fileId, 'Connection to the shop was lost.'));
+          logTransferState({ clientId, batchId, transferId: null, fileName: file.name, state: 'FAILED_NO_CHANNEL' });
           failed++;
           continue;
         }
@@ -417,11 +565,10 @@ export const CustomerTransferPage: React.FC<CustomerTransferPageProps> = ({
         // and buffers. Nothing is shared, so a failure cannot leak into the next.
         const sender = new FileSender(file, dataChannelRef.current, {
           onProgress: (progress) => {
-            setTransferProgresses((prev) => {
-              const updated = [...prev];
-              updated[i] = progress;
-              return updated;
-            });
+            setBatchEntries((prev) => applyProgress(prev, queued.fileId, progress));
+          },
+          onStatusChange: (status) => {
+            logTransferState({ clientId, batchId, transferId: sender.transferId, fileName: file.name, state: status });
           },
           onError: (err) => {
             setErrorMsg(`${file.name}: ${err.message}`);
@@ -462,6 +609,10 @@ export const CustomerTransferPage: React.FC<CustomerTransferPageProps> = ({
   const isReconnecting = workflowState === 'CONNECTING' &&
     !!sessionStorage.getItem(SS.TOKEN) &&
     sessionStorage.getItem(SS.TOKEN) === (token || tokenRef.current);
+
+  const sendableCount = sendableEntries(batchEntries).length;
+  const completedCount = batchEntries.filter((e) => e.status === 'COMPLETED').length;
+  const reselectSummary = describeReselect(batchEntries);
 
   // When entered via the permanent QR (§16) we know the shop's name; otherwise fall back
   // to the generic label used by the manual-code / legacy-token paths.
@@ -686,30 +837,66 @@ export const CustomerTransferPage: React.FC<CustomerTransferPageProps> = ({
               disabled={connectionState !== 'READY' && connectionState !== 'TRANSFERRING' && connectionState !== 'COMPLETED'}
             />
 
-            {selectedFiles.length > 0 && (
+            {batchEntries.length > 0 && (
               <div className="space-y-3">
                 <div className="flex items-center justify-between">
                   <div className="space-y-0.5">
                     <h3 className="text-xs font-semibold uppercase tracking-wider text-text-muted">
-                      {selectedFiles.length} {selectedFiles.length === 1 ? 'document' : 'documents'}
+                      {batchEntries.length} {batchEntries.length === 1 ? 'document' : 'documents'}
                     </h3>
                     <p className="text-[10px] text-text-muted">
-                      {(selectedFiles.reduce((acc, f) => acc + f.size, 0) / (1024 * 1024)).toFixed(2)} MB total
+                      {(batchEntries.reduce((acc, e) => acc + e.size, 0) / (1024 * 1024)).toFixed(2)} MB total
+                      {completedCount > 0 && ` · ${completedCount} sent`}
                     </p>
                   </div>
                 </div>
 
+                {/* A refresh keeps every file's state but not its bytes — say so plainly
+                    rather than leaving rows that could never send. */}
+                {reselectSummary && (
+                  <div className="rounded-xl border border-warning/40 bg-warning-container/25 p-3.5 space-y-1">
+                    <p className="flex items-center gap-1.5 text-xs font-semibold text-text-primary">
+                      <AlertTriangle className="h-3.5 w-3.5 text-warning" />
+                      <span>Some files need to be selected again</span>
+                    </p>
+                    <p className="text-[11px] text-text-secondary leading-relaxed">
+                      Your place in the queue and everything already sent is safe. Your browser
+                      can't keep file contents across a reload, so please pick {reselectSummary}{' '}
+                      again to finish sending.
+                    </p>
+                  </div>
+                )}
+
                 <div className="space-y-2">
-                  {selectedFiles.map((file, idx) => {
-                    const progress = transferProgresses[idx];
-                    if (progress) {
-                      return <TransferProgressCard key={`${progress.transferId}-${idx}`} progress={progress} />;
+                  {batchEntries.map((entry) => {
+                    // A row shows progress once it has been offered; before that (or after a
+                    // refresh cleared its handle) it is a plain file row keyed by fileId.
+                    if (entry.transferId && entry.status !== 'FILE_RESELECT_REQUIRED') {
+                      return (
+                        <TransferProgressCard
+                          key={entry.fileId}
+                          progress={{
+                            transferId: entry.transferId,
+                            fileName: entry.name,
+                            fileSize: entry.size,
+                            transferredBytes: entry.transferredBytes,
+                            percentage: entry.percentage,
+                            speedBytesPerSec: 0,
+                            estimatedRemainingSec: 0,
+                            status: entry.status as TransferProgress['status'],
+                            error: entry.error,
+                          }}
+                        />
+                      );
                     }
                     return (
                       <FileItemCard
-                        key={`${file.name}-${idx}`}
-                        file={file}
-                        onRemove={() => handleRemoveFile(idx)}
+                        key={entry.fileId}
+                        name={entry.name}
+                        size={entry.size}
+                        needsReselect={entry.status === 'FILE_RESELECT_REQUIRED'}
+                        onRemove={() => handleRemoveFile(entry.fileId)}
+                        disabled={workflowState === 'SENDING'}
                       />
                     );
                   })}
@@ -717,14 +904,14 @@ export const CustomerTransferPage: React.FC<CustomerTransferPageProps> = ({
 
                 {!isBatchCompleted ? (
                   <div className="space-y-3 pt-4">
-                    {selectedFiles.length > transferProgresses.length && (
+                    {sendableCount > 0 && (
                       <button
                         onClick={handleSendDocuments}
                         disabled={connectionState !== 'READY' && connectionState !== 'TRANSFERRING' && connectionState !== 'COMPLETED'}
                         className="w-full flex items-center justify-center gap-2 rounded-pill bg-primary hover:bg-primary-hover text-white py-4 text-sm font-semibold transition-all btn-tactile shadow-md disabled:opacity-50 touch-target"
                       >
                         <Send className="h-4 w-4" />
-                        <span>SEND ALL</span>
+                        <span>{sendableCount === batchEntries.length ? 'SEND ALL' : `SEND ${sendableCount}`}</span>
                       </button>
                     )}
 

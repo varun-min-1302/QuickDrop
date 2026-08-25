@@ -71,12 +71,19 @@ export function parseAndValidateQuickDropQr(
   try {
     const url = new URL(trimmed);
 
-    // Origin check: must match the current app origin or a valid QuickDrop dev/tunnel host.
+    // Origin check: must match the current app origin, the public app origin, or localhost for dev.
     const currentUrl = new URL(expectedOrigin);
-    const isSameHost = url.host === currentUrl.host;
+    const expectedAppOrigin = (import.meta as { env?: { VITE_PUBLIC_APP_URL?: string } }).env?.VITE_PUBLIC_APP_URL;
+    let isPublicHost = false;
+    try {
+      if (expectedAppOrigin) {
+        isPublicHost = url.host === new URL(expectedAppOrigin).host;
+      }
+    } catch { /* ignore invalid public origin env var */ }
+    
+    const isSameHost = url.host === currentUrl.host || isPublicHost;
     const isLocalhost = url.hostname === 'localhost' || url.hostname === '127.0.0.1';
-    const isNgrok = url.hostname.endsWith('.ngrok-free.app') || url.hostname.endsWith('.ngrok.io');
-    const originAllowed = isSameHost || isLocalhost || isNgrok;
+    const originAllowed = isSameHost || isLocalhost;
 
     // 3a. Permanent-shop path "/s/QD-XXXXXX" (has no hash fragment).
     const shopMatch = url.pathname.match(/^\/s\/([^/]+)\/?$/);

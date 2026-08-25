@@ -1,8 +1,10 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Link } from 'react-router-dom';
 import { CreateSessionResponse, IceServerConfig, ShopSummary } from '@quickdrop/shared';
 import { SignalingClient } from '../lib/webrtc/signalingClient.js';
 import { useShopPeers } from '../lib/webrtc/useShopPeers.js';
+import { groupDashboard, removeDocument } from '../lib/webrtc/shopDashboardState.js';
+import type { BatchStatus } from '../lib/webrtc/ShopPeerManager.js';
 import { StatusIndicator, AppConnectionState } from '../components/StatusIndicator.js';
 import { QrCodeCard } from '../components/QrCodeCard.js';
 import { TransferProgressCard } from '../components/TransferProgressCard.js';
@@ -50,6 +52,30 @@ type DashboardPhase = 'RESOLVING' | 'NO_SHOP' | 'CONFLICT' | 'ACTIVE' | 'REVOKED
 
 /** Same-tab reuse of an already-claimed device, so a refresh doesn't self-conflict (§11). */
 const DASHBOARD_DEVICE_STORAGE_KEY = 'quickdrop_dashboard_device';
+
+/** Operator-facing wording for a customer's batch lifecycle. */
+const BATCH_STATUS_LABEL: Record<BatchStatus, string> = {
+  EMPTY: 'No Documents',
+  RECEIVING: 'Receiving',
+  READY_TO_PRINT: 'Ready to Print',
+  COMPLETED: 'Batch Complete',
+};
+
+const BATCH_STATUS_STYLE: Record<BatchStatus, string> = {
+  EMPTY: 'bg-surface-variant text-text-muted',
+  RECEIVING: 'bg-warning-container text-warning',
+  READY_TO_PRINT: 'bg-success-container text-success',
+  COMPLETED: 'bg-primary-container text-primary',
+};
+
+/**
+ * Short human-quotable batch reference (e.g. `A82F`). The full batchId stays the
+ * durable key everywhere in code; this is only ever shown, never matched on.
+ */
+function formatBatchRef(batchId: string): string {
+  const tail = batchId.replace(/[^a-zA-Z0-9]/g, '').slice(-4);
+  return (tail || batchId).toUpperCase();
+}
 
 function readStoredDeviceSessionId(publicShopId: string): string | null {
   try {
@@ -109,6 +135,16 @@ export const ShopDashboardPage: React.FC = () => {
   const [iceServers, setIceServers] = useState<IceServerConfig[]>([]);
 
   const { customers, transfers, receivedDocs, setReceivedDocs } = useShopPeers(signalingClient, iceServers);
+
+  /**
+   * Durable per-customer grouping. Derived, never stored: customers/receivedDocs are
+   * each merged one fact at a time, so a new customer can't disturb another's group and
+   * a document can't lose the identity it was stamped with on receipt.
+   */
+  const { groups: customerGroups, orphans: orphanDocs } = useMemo(
+    () => groupDashboard(customers, receivedDocs, transfers),
+    [customers, receivedDocs, transfers]
+  );
 
   // Refs keep the lifecycle callbacks stable and free of stale closures. `signalingRef`
   // mirrors the client state so cleanup can close it without depending on render scope.
@@ -362,17 +398,21 @@ export const ShopDashboardPage: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const handleDeleteReceivedDoc = (transferId: string) => {
+  const handleDeleteReceivedDoc = (documentId: string) => {
     setReceivedDocs((prev) => {
-      const doc = prev.find((d) => d.transferId === transferId);
+      const doc = prev.find((d) => d.documentId === documentId);
       if (doc) URL.revokeObjectURL(doc.objectUrl);
-      return prev.filter((d) => d.transferId !== transferId);
+      return removeDocument(prev, documentId);
     });
   };
 
   // The on-screen QR encodes the PERMANENT customer-entry URL (publicShopId only) — the same
   // value as the printed poster, never a token or session id (spec §14/§E).
-  const getCustomerJoinUrl = () => (shop ? buildShopQrUrl(window.location.origin, shop.publicShopId) : '');
+  const getCustomerJoinUrl = () => {
+    if (!shop) return '';
+    const origin = (import.meta as { env?: { VITE_PUBLIC_APP_URL?: string } }).env?.VITE_PUBLIC_APP_URL || window.location.origin;
+    return buildShopQrUrl(origin, shop.publicShopId);
+  };
 
   // ---- Non-active phases: full-screen status cards -------------------------------------
 
@@ -595,10 +635,10 @@ export const ShopDashboardPage: React.FC = () => {
           <div className="lg:col-span-7 space-y-6">
             <h3 className="text-xs font-semibold uppercase tracking-wider text-text-muted flex items-center gap-2">
               <Users className="h-4 w-4" />
-              <span>Customers ({customers.length})</span>
+              <span>Customers ({customerGroups.length})</span>
             </h3>
 
-            {customers.length === 0 && receivedDocs.length === 0 ? (
+            {customerGroups.length === 0 && orphanDocs.length === 0 ? (
               <div className="flex flex-col items-center justify-center rounded-2xl border border-dashed border-surface-variant bg-surface/50 p-12 text-center space-y-3 min-h-[220px]">
                 <div className="flex h-12 w-12 items-center justify-center rounded-full bg-surface-variant text-text-muted">
                   <Inbox className="h-6 w-6" />
@@ -612,30 +652,38 @@ export const ShopDashboardPage: React.FC = () => {
               </div>
             ) : (
               <div className="space-y-6">
-                {customers.map((c) => {
-                  const custTransfers = Array.from(transfers.get(c.clientId)?.values() || []).filter(p => p.status !== 'COMPLETED');
-                  const custDocs = receivedDocs.filter(d => d.clientId === c.clientId);
-
-                  if (custTransfers.length === 0 && custDocs.length === 0) {
-                    return null;
-                  }
-
+                {customerGroups.map(({ customer: c, documents: custDocs, transfers: custTransfers, documentCount }) => {
+                  const inFlight = custTransfers.filter((p) => p.status !== 'COMPLETED');
                   return (
                     <div key={c.clientId} className="space-y-3 p-4 rounded-2xl bg-surface border border-surface-variant shadow-sm animate-in fade-in duration-200">
-                      <div className="flex items-center justify-between pb-2 border-b border-surface-variant">
-                        <div className="flex items-center gap-2">
-                          <div className={`h-2.5 w-2.5 rounded-full ${c.connectionState === 'CONNECTED' ? 'bg-success' : c.connectionState === 'DISCONNECTED' ? 'bg-text-muted' : 'bg-warning animate-pulse'}`} />
-                          <h4 className="font-semibold text-text-primary text-sm">
-                            {c.displayName || 'Customer'} <span className="text-text-muted font-normal">· {c.customerCode}</span>
-                          </h4>
+                      <div className="flex items-start justify-between gap-3 pb-2 border-b border-surface-variant">
+                        <div className="min-w-0 space-y-1">
+                          <div className="flex items-center gap-2">
+                            <div className={`h-2.5 w-2.5 shrink-0 rounded-full ${c.connectionState === 'CONNECTED' ? 'bg-success' : c.connectionState === 'DISCONNECTED' ? 'bg-text-muted' : 'bg-warning animate-pulse'}`} />
+                            <h4 className="truncate font-semibold text-text-primary text-sm">
+                              {c.displayName || 'Customer'} <span className="text-text-muted font-normal">· {c.customerCode}</span>
+                            </h4>
+                          </div>
+                          {/* Durable identity line: the customer, their batch and how much
+                              they have sent — none of which may change because someone
+                              else joined or this customer's phone briefly dropped. */}
+                          <p className="pl-[18px] text-[11px] text-text-secondary">
+                            {documentCount} {documentCount === 1 ? 'document' : 'documents'}
+                            <span className="text-text-muted"> · Batch #{formatBatchRef(c.batchId)}</span>
+                          </p>
                         </div>
-                        <span className="text-[10px] uppercase font-bold text-text-muted">{c.connectionState}</span>
+                        <div className="flex shrink-0 flex-col items-end gap-1">
+                          <span className={`rounded-pill px-2 py-0.5 text-[10px] font-bold uppercase ${BATCH_STATUS_STYLE[c.batchStatus]}`}>
+                            {BATCH_STATUS_LABEL[c.batchStatus]}
+                          </span>
+                          <span className="text-[10px] uppercase font-bold text-text-muted">{c.connectionState}</span>
+                        </div>
                       </div>
 
-                      {custTransfers.length > 0 && (
+                      {inFlight.length > 0 && (
                         <div className="space-y-2">
                           <h5 className="text-[10px] uppercase font-bold text-text-muted tracking-wider">Receiving</h5>
-                          {custTransfers.map((progress) => (
+                          {inFlight.map((progress) => (
                             <TransferProgressCard key={progress.transferId} progress={progress} />
                           ))}
                         </div>
@@ -646,7 +694,7 @@ export const ShopDashboardPage: React.FC = () => {
                           <h5 className="text-[10px] uppercase font-bold text-text-muted tracking-wider">Completed</h5>
                           {custDocs.map((doc) => (
                             <ReceivedFileCard
-                              key={doc.transferId}
+                              key={doc.documentId}
                               document={doc}
                               onDelete={handleDeleteReceivedDoc}
                             />
@@ -659,18 +707,28 @@ export const ShopDashboardPage: React.FC = () => {
               </div>
             )}
 
-            {/* Orphaned Docs */}
-            {receivedDocs.filter(d => !customers.some(c => c.clientId === d.clientId)).length > 0 && (
-               <div className="space-y-3">
-                 <h3 className="text-xs font-semibold uppercase tracking-wider text-text-muted">Previous Customers</h3>
-                 {receivedDocs.filter(d => !customers.some(c => c.clientId === d.clientId)).map((doc) => (
-                    <ReceivedFileCard
-                      key={doc.transferId}
-                      document={doc}
-                      onDelete={handleDeleteReceivedDoc}
-                    />
-                 ))}
-               </div>
+            {/*
+              Documents whose customer is not in the projection. With clientId as the
+              durable key and customers never removed on disconnect this should stay
+              empty — but a document must never become unattributable, so if one does
+              land here it is still shown under its OWN customer's name and code
+              rather than in an anonymous "Previous Customers" pile.
+            */}
+            {orphanDocs.length > 0 && (
+              <div className="space-y-3">
+                <h3 className="text-xs font-semibold uppercase tracking-wider text-text-muted">
+                  Earlier documents
+                </h3>
+                {orphanDocs.map((doc) => (
+                  <div key={doc.documentId} className="space-y-1.5">
+                    <p className="pl-1 text-[11px] font-medium text-text-secondary">
+                      {doc.displayName || 'Customer'}
+                      <span className="text-text-muted font-normal"> · {doc.customerCode} · Batch #{formatBatchRef(doc.batchId)}</span>
+                    </p>
+                    <ReceivedFileCard document={doc} onDelete={handleDeleteReceivedDoc} />
+                  </div>
+                ))}
+              </div>
             )}
           </div>
         </div>
